@@ -42,9 +42,9 @@ ChatClientAgent agent = chatClient.AsAIAgent(
     instructions: "You are a helpful assistant.");
 
 // Start a conversation
-AgentThread thread = await agent.GetNewThreadAsync();
+AgentSession session = await agent.CreateSessionAsync();
 
-await foreach (AgentResponseUpdate update in agent.RunStreamingAsync("Hello!", thread))
+await foreach (AgentResponseUpdate update in agent.RunStreamingAsync("Hello!", session))
 {
     // Handle streaming response
 }
