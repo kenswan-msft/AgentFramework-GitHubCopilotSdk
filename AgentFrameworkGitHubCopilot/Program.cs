@@ -2,14 +2,14 @@
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 
-var chatClient = new CopilotSdkChatClient(modelId: "opus-4.5");
+var chatClient = new CopilotSdkChatClient(modelId: "gpt-4.1");
 
 ChatClientAgent agent = chatClient.AsAIAgent(
     name: "Local Agent",
     description: "Helpful agent assistant.",
     instructions: "You are a helpful assistant.");
 
-AgentThread thread = await agent.GetNewThreadAsync();
+AgentSession session = await agent.CreateSessionAsync();
 
 Console.WriteLine("Welcome to the Agent Framework GitHub Copilot demo!");
 Console.WriteLine("Type your messages below. Type 'quit' or 'exit' to stop session.");
@@ -33,7 +33,7 @@ try
             break;
         }
 
-        await foreach (AgentResponseUpdate update in agent.RunStreamingAsync(message, thread))
+        await foreach (AgentResponseUpdate update in agent.RunStreamingAsync(message, session))
         {
             foreach (AIContent content in update.Contents)
             {

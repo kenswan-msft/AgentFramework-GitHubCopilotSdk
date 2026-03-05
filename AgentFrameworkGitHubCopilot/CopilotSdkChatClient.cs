@@ -1,25 +1,29 @@
 ﻿using GitHub.Copilot.SDK;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 
 namespace AgentFrameworkGitHubCopilot;
 
 public class CopilotSdkChatClient(
-    string? modelId = "gpt-5",
+    string? modelId = "gpt-4.1",
     CopilotClientOptions? clientOptions = null,
-    SessionConfig? sessionConfig = null)
-    : IChatClient
+    SessionConfig? sessionConfig = null,
+    ILogger<CopilotSdkChatClient>? logger = null)
+    : IChatClient, IAsyncDisposable
 {
     private readonly CopilotClient client = new(clientOptions);
 
     private readonly SessionConfig sessionConfig = sessionConfig
                                                    ?? new SessionConfig
                                                    {
-                                                       Model = modelId ?? "gpt-5"
+                                                       Model = modelId ?? "gpt-4.1",
+                                                       OnPermissionRequest = PermissionHandler.ApproveAll
                                                    };
 
-    private readonly SemaphoreSlim sessionLock = new(1, 1);
-    private CopilotSession? session;
+    private bool started;
+    private readonly SemaphoreSlim startLock = new(1, 1);
     private bool disposed;
 
     public ChatClientMetadata Metadata { get; } = new("CopilotChatClient", null, modelId);
@@ -31,25 +35,38 @@ public class CopilotSdkChatClient(
     {
         ArgumentNullException.ThrowIfNull(messages);
 
-        CopilotSession nonStreamingSession =
-            await GetOrCreateSessionAsync(options, streaming: false, cancellationToken)
-                .ConfigureAwait(false);
+        await EnsureStartedAsync(cancellationToken).ConfigureAwait(false);
 
-        // Convert messages to a single prompt (Copilot SDK takes text prompts)
-        string? prompt = ConvertMessagesToPrompt(messages);
+        (SystemMessageConfig? systemMessage, string? prompt) = ExtractSystemAndPrompt(messages, options);
+
+        string requestModel = options?.ModelId ?? sessionConfig.Model;
+
+        // Create a per-request session to avoid leaking conversation context between callers
+        CopilotSession requestSession = await client.CreateSessionAsync(
+            new SessionConfig
+            {
+                Model = requestModel,
+                Streaming = false,
+                Tools = MergeTools(sessionConfig.Tools, options?.Tools),
+                SystemMessage = systemMessage ?? sessionConfig.SystemMessage,
+                OnPermissionRequest = sessionConfig.OnPermissionRequest
+            },
+            cancellationToken).ConfigureAwait(false);
 
         if (string.IsNullOrEmpty(prompt))
         {
+            await requestSession.DisposeAsync().ConfigureAwait(false);
+
             return new ChatResponse([])
             {
-                ModelId = sessionConfig.Model
+                ModelId = requestModel
             };
         }
 
         var done = new TaskCompletionSource<string>();
         string responseContent = "";
 
-        IDisposable subscription = nonStreamingSession.On(evt =>
+        IDisposable subscription = requestSession.On(evt =>
         {
             switch (evt)
             {
@@ -69,7 +86,7 @@ public class CopilotSdkChatClient(
 
         try
         {
-            await nonStreamingSession.SendAsync(
+            await requestSession.SendAsync(
                 new MessageOptions
                 {
                     Prompt = prompt
@@ -81,15 +98,34 @@ public class CopilotSdkChatClient(
 
             string response = await done.Task.WaitAsync(cts.Token).ConfigureAwait(false);
 
+            // Simulate structured output: normalize the response JSON to match the requested schema.
+            if (options?.ResponseFormat is ChatResponseFormatJson { Schema: JsonElement schema })
+            {
+                logger?.LogDebug("Copilot raw response: {RawResponse}", response);
+
+                string? normalized = CopilotSdkJsonResponseNormalizer.TryNormalize(response, schema);
+
+                if (normalized is not null)
+                {
+                    logger?.LogDebug("Copilot normalized response: {NormalizedResponse}", normalized);
+                    response = normalized;
+                }
+                else
+                {
+                    logger?.LogWarning("Copilot response normalization failed; using raw response.");
+                }
+            }
+
             return new ChatResponse(new ChatMessage(ChatRole.Assistant, response))
             {
-                ModelId = sessionConfig.Model,
+                ModelId = requestModel,
                 CreatedAt = DateTimeOffset.UtcNow
             };
         }
         finally
         {
             subscription.Dispose();
+            await requestSession.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -100,18 +136,23 @@ public class CopilotSdkChatClient(
     {
         ArgumentNullException.ThrowIfNull(messages);
 
-        // Create a new session with streaming enabled for each streaming request
+        await EnsureStartedAsync(cancellationToken).ConfigureAwait(false);
+
+        (SystemMessageConfig? systemMessage, string? prompt) = ExtractSystemAndPrompt(messages, options);
+
+        string requestModel = options?.ModelId ?? sessionConfig.Model;
+
+        // Create a per-request session with streaming enabled
         CopilotSession streamingSession = await client.CreateSessionAsync(
             new SessionConfig
             {
-                Model = options?.ModelId ?? sessionConfig.Model,
+                Model = requestModel,
                 Streaming = true,
-                Tools = sessionConfig.Tools,
-                SystemMessage = sessionConfig.SystemMessage
+                Tools = MergeTools(sessionConfig.Tools, options?.Tools),
+                SystemMessage = systemMessage ?? sessionConfig.SystemMessage,
+                OnPermissionRequest = sessionConfig.OnPermissionRequest
             },
             cancellationToken).ConfigureAwait(false);
-
-        string? prompt = ConvertMessagesToPrompt(messages);
 
         if (string.IsNullOrEmpty(prompt))
         {
@@ -130,8 +171,7 @@ public class CopilotSdkChatClient(
                         new ChatResponseUpdate(ChatRole.Assistant, delta.Data.DeltaContent)
                         {
                             Role = ChatRole.Assistant,
-                            // Text = delta.Data.DeltaContent,
-                            ModelId = sessionConfig.Model,
+                            ModelId = requestModel,
                             ResponseId = responseId,
                             CreatedAt = DateTimeOffset.UtcNow
                         });
@@ -196,6 +236,12 @@ public class CopilotSdkChatClient(
 
     public void Dispose()
     {
+        DisposeAsync().AsTask().GetAwaiter().GetResult();
+        GC.SuppressFinalize(this);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
         if (disposed)
         {
             return;
@@ -203,50 +249,94 @@ public class CopilotSdkChatClient(
 
         disposed = true;
 
-        session?.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        client.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        sessionLock.Dispose();
+        await client.DisposeAsync().ConfigureAwait(false);
+        startLock.Dispose();
 
         GC.SuppressFinalize(this);
     }
 
-    private async Task<CopilotSession> GetOrCreateSessionAsync(
-        ChatOptions? options,
-        bool streaming,
-        CancellationToken cancellationToken)
+    private async Task EnsureStartedAsync(CancellationToken cancellationToken)
     {
-        await sessionLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (started)
+        {
+            return;
+        }
+
+        await startLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (session == null)
+            if (!started)
             {
                 await client.StartAsync(cancellationToken).ConfigureAwait(false);
-
-                session = await client.CreateSessionAsync(
-                    new SessionConfig
-                    {
-                        Model = options?.ModelId ?? sessionConfig.Model,
-                        Streaming = streaming,
-                        Tools = sessionConfig.Tools,
-                        SystemMessage = sessionConfig.SystemMessage
-                    },
-                    cancellationToken).ConfigureAwait(false);
+                started = true;
             }
-
-            return session;
         }
         finally
         {
-            sessionLock.Release();
+            startLock.Release();
         }
     }
 
-    private static string ConvertMessagesToPrompt(IEnumerable<ChatMessage> messages)
+    /// <summary>
+    /// Merges constructor-level tools with per-request tools from <see cref="ChatOptions.Tools"/>.
+    /// The Copilot SDK handles tool execution internally via <see cref="AIFunction.InvokeAsync"/>,
+    /// so we just need to register them on the session.
+    /// </summary>
+    private static ICollection<AIFunction>? MergeTools(
+        ICollection<AIFunction>? sessionTools,
+        IList<AITool>? requestTools)
     {
-        // TODO: Combining messages here, but can leverage session ID for chat history integration later
-        IEnumerable<string> textMessages = messages
-            .Select(m => $"{m.Role}: {m.Text}");
+        var requestFunctions = requestTools?
+            .OfType<AIFunction>()
+            .ToList();
 
-        return string.Join("\n", textMessages);
+        if (requestFunctions is null or { Count: 0 })
+        {
+            return sessionTools;
+        }
+
+        if (sessionTools is null or { Count: 0 })
+        {
+            return requestFunctions;
+        }
+
+        return [.. sessionTools, .. requestFunctions];
+    }
+
+    private static (SystemMessageConfig? SystemMessage, string? Prompt) ExtractSystemAndPrompt(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options)
+    {
+        List<string> systemParts = [];
+        List<string> promptParts = [];
+
+        foreach (ChatMessage message in messages)
+        {
+            if (message.Role == ChatRole.System)
+            {
+                systemParts.Add(message.Text ?? string.Empty);
+            }
+            else
+            {
+                string role = message.Role.Value;
+                string content = message.Text ?? string.Empty;
+                promptParts.Add($"{role}: {content}");
+            }
+        }
+
+        // When the caller requests JSON output (e.g., RunAsync<T>), reinforce it
+        // in the system message since the Copilot SDK does not support ResponseFormat.
+        if (options?.ResponseFormat is ChatResponseFormatJson)
+        {
+            systemParts.Add("You MUST respond with ONLY valid JSON. No markdown fences, no explanation, no extra text.");
+        }
+
+        SystemMessageConfig? systemMessage = systemParts.Count > 0
+            ? new SystemMessageConfig { Content = string.Join("\n\n", systemParts), Mode = SystemMessageMode.Replace }
+            : null;
+
+        string? prompt = promptParts.Count > 0 ? string.Join("\n", promptParts) : null;
+
+        return (systemMessage, prompt);
     }
 }
